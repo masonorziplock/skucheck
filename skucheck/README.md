@@ -86,3 +86,51 @@ Important reliability rule remains unchanged: failed store lookups show as **Loo
 ## Keyword Search Rule
 
 Multi-word product searches preserve spaces. For example, `black cat 4` remains `black cat 4` for store lookup. Exact SKU-style inputs like `hf 4198 001` still normalize to `HF4198-001`.
+
+## V1.3 Seamless Reliability + Catalog Expansion
+
+This update is intentionally low-risk and keeps the existing search, tracking, release-calendar, Railway, and PWA behavior intact.
+
+Added:
+- Expanded smart-search catalog with 30+ Nike, Jordan, Nike SB, adidas, New Balance, ASICS, and Saucony products.
+- More aliases for common sneaker keywords so searches like "reverse grinch", "panda dunk", "samba", "gel kayano 14", and "black cat 4" resolve more consistently.
+- Data audit API at `/api/admin/data-audit` for quick verification of catalog, release, store, and adapter readiness.
+- Improved QA checks for catalog coverage and the data audit route.
+- Shared coverage-confidence scoring so UI confidence and backend reliability logic stay consistent.
+
+Preserved:
+- Multi-word keywords keep their spaces and word boundaries.
+- SKU-shaped spaced input such as `hf 4198 001` still normalizes to `HF4198-001`.
+- Future-release-only calendar behavior remains intact.
+- Lookup Unavailable is never treated as Sold Out.
+- No dependency, build artifact, or Railway deployment changes were added.
+
+## V1.6 Private Beta Final QA
+
+This version adds a private beta readiness layer without changing core search behavior.
+
+### Added
+
+- Beta readiness API: `/api/admin/beta-readiness`
+- Private Beta Instructions card in the Beta tab
+- Store expansion readiness score
+- Extra beta checklist item for readiness verification
+- App version updated to `1.6.0`
+
+### Safety rules preserved
+
+- Multi-word keyword searches preserve spaces.
+- SKU-style spaced input can still normalize correctly.
+- Release Calendar only shows future release dates.
+- Lookup Unavailable never means Sold Out.
+- Failed store adapters cannot crash the full search.
+
+### Suggested beta flow
+
+1. Deploy to Railway.
+2. Open the Railway URL on phone and desktop.
+3. Run the Beta readiness check.
+4. Run the guided Beta test sheet.
+5. Run Store Check from Admin.
+6. Submit feedback after each test session.
+7. Export logs before making store expansion decisions.

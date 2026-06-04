@@ -38,11 +38,14 @@ import QualityAssuranceCenter from "@/components/QualityAssuranceCenter";
 import BetaFeedbackForm from "@/components/BetaFeedbackForm";
 import BetaTestSheet from "@/components/BetaTestSheet";
 import KnownLimitations from "@/components/KnownLimitations";
+import PrivateBetaGuide from "@/components/PrivateBetaGuide";
 import { normalizeSearchQuery } from "@/lib/sku";
 import { approvedStores } from "@/lib/stores";
 import { releaseCalendar, getUpcomingReleases, type ReleaseCalendarItem } from "@/lib/release-calendar";
+import { buildReleaseNotification, getReleaseNotificationStatus } from "@/lib/notification-engine";
 import { APP_VERSION, SEARCH_CACHE_TTL_SECONDS, getRateLimitLabel } from "@/lib/app-config";
 import { isAvailableStatus, statusSortWeight, userFacingStatusLabel } from "@/lib/status";
+import { getCoverageConfidenceScore } from "@/lib/reliability";
 
 const quickSearches = ["HF4198-001", "White Cement 4", "Jordan 4", "SB Dunk", "Travis Scott", "New Balance 990"];
 const navItems = [
@@ -179,11 +182,56 @@ type AnalyticsSnapshot = {
 
 
 
+type MonitoringSnapshot = {
+  generatedAt: string;
+  stores: {
+    total: number;
+    healthy: number;
+    needsReview: number;
+    unstable: number;
+    rows: {
+      storeId: string;
+      storeName: string;
+      enabled: boolean;
+      health: string;
+      healthScore: number;
+      totalLookups: number;
+      failureRate: number;
+      verificationRate: number;
+      lastSuccess: string | null;
+      lastStatus: string;
+      expectedInventoryVisibility: string;
+      notes: string;
+    }[];
+  };
+  search: {
+    totalSearches: number;
+    matchRate: number;
+    cacheRate: number;
+    lookupUnavailableRate: number;
+    failedRequests: number;
+    recentSearches: AnalyticsSnapshot["recentSearches"];
+  };
+  alerts: { mode: string; delivery: string; status: string };
+  releases: { upcomingCount: number; nextRelease: ReleaseCalendarItem | null };
+  catalog: { totalProducts: number; aliasCount: number; brands: Record<string, number> };
+  risk: { level: string; note: string };
+};
+
 type CacheSnapshot = {
   activeEntries: number;
   expiredEntriesRemoved: number;
   ttlSeconds: number;
   generatedAt: string;
+};
+
+type BetaReadinessSnapshot = {
+  checkedAt: string;
+  score: number;
+  status: string;
+  recommendation: string;
+  nextStep: string;
+  checks: { label: string; passed: boolean; detail: string; weight: number }[];
 };
 
 type StorePreference = {
@@ -316,21 +364,15 @@ function uniqueSizes(results: HydratedSearchResult[]) {
 
 function getCoverageConfidence(payload: SearchPayload | null, results: HydratedSearchResult[]) {
   if (!payload) return { label: "Ready", score: 0, note: "Run a search to calculate coverage confidence." };
-  const checked = results.length || 1;
-  const matches = payload.intelligence?.matchesFound || 0;
-  const available = payload.intelligence?.availableCount || 0;
-  const unavailable = results.filter((item) => item.status === "Unavailable").length;
-  const productScore = payload.product?.confidenceScore || 0;
-  const storeScore = Math.round(((matches + available) / checked) * 45);
-  const reliabilityPenalty = Math.round((unavailable / checked) * 25);
-  const score = Math.max(0, Math.min(100, Math.round((productScore * 0.55) + storeScore - reliabilityPenalty)));
-  const label = score >= 78 ? "High" : score >= 52 ? "Medium" : "Needs Verification";
-  const note = label === "High"
-    ? "Strong product match with reliable store coverage."
-    : label === "Medium"
-      ? "Useful result, but verify source links or hidden sizes."
-      : "Treat this as a lead until store links confirm details.";
-  return { label, score, note };
+
+  return getCoverageConfidenceScore({
+    storesChecked: results.length,
+    matchesFound: payload.intelligence?.matchesFound || 0,
+    availableCount: payload.intelligence?.availableCount || 0,
+    soldOutCount: payload.intelligence?.soldOutCount || 0,
+    unavailableCount: results.filter((item) => item.status === "Unavailable").length,
+    productConfidenceScore: payload.product?.confidenceScore || 0,
+  });
 }
 
 function getReleaseCountdown(value: string) {
@@ -368,16 +410,21 @@ export default function HomePage() {
   const [restockHistory, setRestockHistory] = useState<RestockEvent[]>([]);
   const [inAppNotifications, setInAppNotifications] = useState<AppNotification[]>([]);
   const [notificationPermission, setNotificationPermission] = useState("unsupported");
+  const [releaseRemindersEnabled, setReleaseRemindersEnabled] = useState(false);
   const [deferredInstallPrompt, setDeferredInstallPrompt] = useState<any>(null);
   const [alertSize, setAlertSize] = useState("Any Size");
   const [notice, setNotice] = useState("");
   const [themeLabel, setThemeLabel] = useState("Dark");
   const [analytics, setAnalytics] = useState<AnalyticsSnapshot | null>(null);
   const [analyticsLoading, setAnalyticsLoading] = useState(false);
+  const [monitoring, setMonitoring] = useState<MonitoringSnapshot | null>(null);
+  const [monitoringLoading, setMonitoringLoading] = useState(false);
   const [adapterTest, setAdapterTest] = useState<AdapterTestSnapshot | null>(null);
   const [adapterTestLoading, setAdapterTestLoading] = useState(false);
   const [onboardingOpen, setOnboardingOpen] = useState(false);
   const [cacheSnapshot, setCacheSnapshot] = useState<CacheSnapshot | null>(null);
+  const [betaReadiness, setBetaReadiness] = useState<BetaReadinessSnapshot | null>(null);
+  const [betaReadinessLoading, setBetaReadinessLoading] = useState(false);
   const [storePreferences, setStorePreferences] = useState<StorePreference[]>(() => approvedStores.map((store) => ({ storeId: store.id, enabled: true })));
   const [compactMode, setCompactMode] = useState(false);
   const [autoOpenResults, setAutoOpenResults] = useState(true);
@@ -443,6 +490,20 @@ export default function HomePage() {
     }
   }
 
+  async function fetchMonitoring() {
+    setMonitoringLoading(true);
+    try {
+      const response = await fetch("/api/admin/monitoring", { cache: "no-store" });
+      if (!response.ok) throw new Error("Monitoring failed to load");
+      const data: MonitoringSnapshot = await response.json();
+      setMonitoring(data);
+    } catch {
+      showNotice("Production monitoring could not load");
+    } finally {
+      setMonitoringLoading(false);
+    }
+  }
+
   async function runAdapterTest(testQuery = normalized || sku) {
     setAdapterTestLoading(true);
     try {
@@ -462,6 +523,21 @@ export default function HomePage() {
     }
   }
 
+  async function fetchBetaReadiness() {
+    setBetaReadinessLoading(true);
+    try {
+      const response = await fetch("/api/admin/beta-readiness", { cache: "no-store" });
+      if (!response.ok) throw new Error("Beta readiness failed");
+      const data: BetaReadinessSnapshot = await response.json();
+      setBetaReadiness(data);
+      showNotice("Beta readiness checked");
+    } catch {
+      showNotice("Beta readiness could not load");
+    } finally {
+      setBetaReadinessLoading(false);
+    }
+  }
+
   useEffect(() => {
     setFavorites(safeReadLocal<string[]>("ssf:favorites", []));
     setTrackedProducts(safeReadLocal<TrackedProduct[]>("ssf:trackedProducts", []));
@@ -471,6 +547,7 @@ export default function HomePage() {
     setStorePreferences(safeReadLocal<StorePreference[]>("ssf:storePreferences", approvedStores.map((store) => ({ storeId: store.id, enabled: true }))));
     setCompactMode(safeReadLocal<boolean>("ssf:compactMode", false));
     setAutoOpenResults(safeReadLocal<boolean>("ssf:autoOpenResults", true));
+    setReleaseRemindersEnabled(safeReadLocal<boolean>("ssf:releaseRemindersEnabled", false));
     setNotificationPermission(typeof window !== "undefined" && "Notification" in window ? window.Notification.permission : "unsupported");
     if (!safeReadLocal<boolean>("ssf:onboardingComplete", false)) setOnboardingOpen(true);
     if ("serviceWorker" in navigator) {
@@ -507,11 +584,20 @@ export default function HomePage() {
   useEffect(() => safeWriteLocal("ssf:storePreferences", storePreferences), [storePreferences]);
   useEffect(() => safeWriteLocal("ssf:compactMode", compactMode), [compactMode]);
   useEffect(() => safeWriteLocal("ssf:autoOpenResults", autoOpenResults), [autoOpenResults]);
+  useEffect(() => safeWriteLocal("ssf:releaseRemindersEnabled", releaseRemindersEnabled), [releaseRemindersEnabled]);
 
   useEffect(() => {
-    if (activeView === "Admin") void fetchAnalytics();
+    if (activeView === "Admin") {
+      void fetchAnalytics();
+      void fetchMonitoring();
+    }
     if (activeView === "Settings") void fetchCacheSnapshot();
   }, [activeView]);
+
+  useEffect(() => {
+    evaluateReleaseNotificationEngine();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [releaseRemindersEnabled, trackedProducts.length]);
 
   async function runSearch(nextSku = sku) {
     const cleanSku = normalizeSearchQuery(nextSku);
@@ -535,8 +621,11 @@ export default function HomePage() {
       updateTrackingFromSearch(data, nextResults);
       evaluateAlerts(data, nextResults);
       if (autoOpenResults && activeView !== "Search") handleNav("Search");
-      if (activeView === "Admin") void fetchAnalytics();
-    if (activeView === "Settings") void fetchCacheSnapshot();
+      if (activeView === "Admin") {
+        void fetchAnalytics();
+        void fetchMonitoring();
+      }
+      if (activeView === "Settings") void fetchCacheSnapshot();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Search failed");
     } finally {
@@ -586,8 +675,15 @@ export default function HomePage() {
 
   function sendBrowserNotification(title: string, body: string) {
     if (typeof window === "undefined" || !("Notification" in window) || window.Notification.permission !== "granted") return;
+    const options = { body, icon: "/icons/icon-192.png", badge: "/icons/icon-192.png" };
     try {
-      new window.Notification(title, { body, icon: "/icons/icon-192.png", badge: "/icons/icon-192.png" });
+      if ("serviceWorker" in navigator) {
+        navigator.serviceWorker.ready
+          .then((registration) => registration.showNotification(title, options))
+          .catch(() => new window.Notification(title, options));
+        return;
+      }
+      new window.Notification(title, options);
     } catch {
       // Browser notifications are best-effort; in-app alerts still record the event.
     }
@@ -596,6 +692,49 @@ export default function HomePage() {
   function clearNotifications() {
     setInAppNotifications([]);
     showNotice("Notification center cleared");
+  }
+
+  function evaluateReleaseNotificationEngine() {
+    if (!releaseRemindersEnabled || !trackedProducts.length) return;
+    const trackedSkus = new Set(trackedProducts.map((item) => item.sku));
+    const todayKey = new Date().toISOString().slice(0, 10);
+    const sent = safeReadLocal<Record<string, string>>("ssf:releaseReminderSent", {});
+    const nextSent = { ...sent };
+    let notificationsCreated = 0;
+
+    for (const release of releaseCalendar) {
+      if (!trackedSkus.has(release.sku)) continue;
+      const status = getReleaseNotificationStatus(release.releaseDate);
+      if (!status.shouldNotify) continue;
+      const key = `${release.sku}:${status.kind}`;
+      if (nextSent[key] === todayKey) continue;
+      const notification = buildReleaseNotification(release, status);
+      addInAppNotification(notification.title, notification.body, release.sku);
+      sendBrowserNotification(notification.title, notification.body);
+      nextSent[key] = todayKey;
+      notificationsCreated += 1;
+    }
+
+    if (notificationsCreated) safeWriteLocal("ssf:releaseReminderSent", nextSent);
+  }
+
+  async function enableReleaseReminderEngine() {
+    if (typeof window !== "undefined" && "Notification" in window && window.Notification.permission !== "granted") {
+      await requestNotificationPermission();
+    }
+    setReleaseRemindersEnabled(true);
+    showNotice("Release reminders enabled");
+  }
+
+  async function scanTrackedProducts() {
+    const targets = trackedProducts.slice(0, 5);
+    if (!targets.length) return showNotice("Track products before running a scan");
+    showNotice(`Scanning ${targets.length} tracked product${targets.length === 1 ? "" : "s"}`);
+    for (const item of targets) {
+      await runSearch(item.sku);
+    }
+    addInAppNotification("Tracked scan complete", `${targets.length} tracked product${targets.length === 1 ? "" : "s"} checked.`, targets[0]?.sku);
+    showNotice("Tracked product scan complete");
   }
 
   function saveFavorite() {
@@ -835,7 +974,7 @@ export default function HomePage() {
     if (typeof window === "undefined") return;
     const ok = window.confirm("Reset local favorites, alerts, tracked products, history, notifications, and settings on this device?");
     if (!ok) return;
-    ["ssf:favorites", "ssf:trackedProducts", "ssf:sizeAlerts", "ssf:restockHistory", "ssf:notifications", "ssf:recentSearches", "ssf:storePreferences", "ssf:compactMode", "ssf:autoOpenResults", "ssf:onboardingComplete"].forEach((key) => window.localStorage.removeItem(key));
+    ["ssf:favorites", "ssf:trackedProducts", "ssf:sizeAlerts", "ssf:restockHistory", "ssf:notifications", "ssf:recentSearches", "ssf:storePreferences", "ssf:compactMode", "ssf:autoOpenResults", "ssf:onboardingComplete", "ssf:releaseRemindersEnabled", "ssf:releaseReminderSent"].forEach((key) => window.localStorage.removeItem(key));
     setFavorites([]);
     setTrackedProducts([]);
     setAlerts([]);
@@ -845,6 +984,7 @@ export default function HomePage() {
     setStorePreferences(approvedStores.map((store) => ({ storeId: store.id, enabled: true })));
     setCompactMode(false);
     setAutoOpenResults(true);
+    setReleaseRemindersEnabled(false);
     showNotice("Local app data reset");
   }
 
@@ -1037,6 +1177,10 @@ export default function HomePage() {
                 )}
                 {activeView === "Watchlists" && (
                   <div className="tracking-list">
+                    <div className="history-actions">
+                      <button onClick={() => void scanTrackedProducts()}><RefreshCw size={15} /> Scan Tracked Products</button>
+                      <button onClick={() => handleNav("Alerts")}><Bell size={15} /> Alert Center</button>
+                    </div>
                     <div className="watchlist-collections">
                       {["My Jordans", "My Dunks", "New Balance Watch", "Upcoming Releases", "General Watchlist"].map((group) => {
                         const count = group === "Upcoming Releases"
@@ -1080,6 +1224,21 @@ export default function HomePage() {
                         <button className="icon-danger" onClick={() => removeAlert(item.id)} aria-label={`Remove alert ${item.id}`}><Trash2 size={15} /></button>
                       </div>
                     )) : <EmptyState icon={<Bell size={28} />} title="No size alerts" body="Search a product, choose a size, then tap Save Size Alert. Alerts are stored locally on this device." action={<button onClick={() => handleNav("Search")}>Create alert</button>} /> }
+
+                    <div className="history-card">
+                      <div className="recent-title"><Zap size={16} /> Notification Engine</div>
+                      <p className="quiet">Release reminders and restock alerts use browser notifications when permission is granted. In-app alerts always remain available.</p>
+                      <div className="settings-grid compact-settings">
+                        <button onClick={() => releaseRemindersEnabled ? setReleaseRemindersEnabled(false) : void enableReleaseReminderEngine()}>{releaseRemindersEnabled ? "Disable Release Reminders" : "Enable Release Reminders"}</button>
+                        <button onClick={() => void scanTrackedProducts()}>Scan Tracked Products</button>
+                        <button onClick={requestNotificationPermission}>Notification Permission</button>
+                      </div>
+                      <div className="setting-stats">
+                        <span>Browser permission: <strong>{notificationPermission}</strong></span>
+                        <span>Release reminders: <strong>{releaseRemindersEnabled ? "On" : "Off"}</strong></span>
+                        <span>Tracked products: <strong>{trackedProducts.length}</strong></span>
+                      </div>
+                    </div>
 
                     <div className="history-card">
                       <div className="recent-title"><Bell size={16} /> Notification Center <button onClick={clearNotifications}>Clear</button></div>
@@ -1194,6 +1353,29 @@ export default function HomePage() {
                       </div>
                       <button onClick={() => handleNav("Search")}><Search size={15} /> Run Search</button>
                     </div>
+                    <PrivateBetaGuide />
+                    <div className="beta-card">
+                      <div className="beta-card-title"><ShieldCheck size={18} /> Store Expansion Readiness</div>
+                      <p className="quiet">Check this before inviting testers or adding more stores. It does not change live search behavior.</p>
+                      <button onClick={() => void fetchBetaReadiness()} disabled={betaReadinessLoading}>
+                        <ListChecks size={15} /> {betaReadinessLoading ? "Checking…" : "Check Beta Readiness"}
+                      </button>
+                      {betaReadiness ? (
+                        <>
+                          <div className="admin-kpis compact-kpis">
+                            <KpiCard tone={betaReadiness.score >= 90 ? "green" : betaReadiness.score >= 75 ? "gold" : "red"} icon={<ShieldCheck size={17} />} label="Readiness" value={`${betaReadiness.score}%`} note={betaReadiness.status} />
+                            <KpiCard icon={<Store size={17} />} label="Stores Enabled" value={`${enabledStoreCount}/${approvedStores.length}`} note="Before scaling" />
+                            <KpiCard icon={<CalendarDays size={17} />} label="Upcoming" value={upcomingReleases.length} note="Future releases only" />
+                          </div>
+                          <p className="quiet">{betaReadiness.recommendation}</p>
+                          <div className="qa-card beta-checklist">
+                            {betaReadiness.checks.map((check) => (
+                              <label key={check.label}><input type="checkbox" readOnly checked={check.passed} /> {check.label}: {check.detail}</label>
+                            ))}
+                          </div>
+                        </>
+                      ) : <p className="quiet">Run the check to confirm store, catalog, release, packaging, and safety guardrails.</p>}
+                    </div>
                     <BetaFeedbackForm currentQuery={sku} resolvedSku={payload?.resolvedSku || normalized} onSubmitted={() => showNotice("Beta feedback saved")} />
                     <KnownLimitations />
                     <BetaTestSheet onRunSearch={(query) => void runSearch(query)} />
@@ -1206,6 +1388,7 @@ export default function HomePage() {
                         <label><input type="checkbox" readOnly checked={Boolean(productImage)} /> Confirm image fallback works</label>
                         <label><input type="checkbox" readOnly checked={Boolean(cacheSnapshot)} /> Check cache status from Settings/Admin</label>
                         <label><input type="checkbox" readOnly checked={Boolean(adapterTest)} /> Run store health check</label>
+                        <label><input type="checkbox" readOnly checked={Boolean(betaReadiness)} /> Run beta readiness check</label>
                       </div>
                     </div>
                   </div>
@@ -1221,8 +1404,9 @@ export default function HomePage() {
                 {activeView === "Admin" && (
                   <div className="admin-dashboard">
                     <div className="admin-actions">
-                      <button onClick={() => void fetchAnalytics()} disabled={analyticsLoading}>{analyticsLoading ? "Refreshing…" : "Refresh Dashboard"}</button>
+                      <button onClick={() => { void fetchAnalytics(); void fetchMonitoring(); }} disabled={analyticsLoading || monitoringLoading}>{analyticsLoading || monitoringLoading ? "Refreshing…" : "Refresh Dashboard"}</button>
                       <button onClick={() => void runAdapterTest()} disabled={adapterTestLoading}>{adapterTestLoading ? "Checking Stores…" : "Run Store Check"}</button>
+                      <button onClick={() => void fetchMonitoring()} disabled={monitoringLoading}>{monitoringLoading ? "Monitoring…" : "Production Monitor"}</button>
                       <button onClick={() => void fetchCacheSnapshot()}>Cache Status</button>
                       <a className="settings-link-button" href="/api/admin/export/search-logs" target="_blank" rel="noreferrer">Export Logs CSV</a>
                       <button onClick={() => void resetDashboard()} disabled={analyticsLoading}>Reset Session Stats</button>
@@ -1235,6 +1419,23 @@ export default function HomePage() {
                       <KpiCard tone="red" icon={<ShieldCheck size={19} />} label="Unavailable" value={`${analytics?.totals.unavailableRate ?? 0}%`} note="Not counted as sold out" />
                       <KpiCard icon={<Layers3 size={19} />} label="Tracked" value={trackedProducts.length} note="This device" />
                       <KpiCard icon={<Bell size={19} />} label="Alerts" value={alerts.length} note={`${restockHistory.length} triggered history`} />
+                    </div>
+
+                    <div className="health-table-wrap">
+                      <div className="recent-title"><Activity size={16} /> Production Monitoring</div>
+                      {monitoring ? (
+                        <>
+                          <div className="admin-kpis compact-kpis">
+                            <KpiCard tone={monitoring.risk.level === "Stable" ? "green" : "gold"} icon={<ShieldCheck size={17} />} label="Risk" value={monitoring.risk.level} note={monitoring.risk.note} />
+                            <KpiCard tone="green" icon={<Store size={17} />} label="Healthy Stores" value={`${monitoring.stores.healthy}/${monitoring.stores.total}`} note={`${monitoring.stores.needsReview} need review`} />
+                            <KpiCard tone="gold" icon={<Search size={17} />} label="Lookup Unavailable" value={`${monitoring.search.lookupUnavailableRate}%`} note="Never counted as sold out" />
+                            <KpiCard icon={<Bell size={17} />} label="Notification Engine" value={monitoring.alerts.status} note={monitoring.alerts.mode} />
+                            <KpiCard icon={<CalendarDays size={17} />} label="Upcoming Releases" value={monitoring.releases.upcomingCount} note={monitoring.releases.nextRelease?.title || "No dated future releases"} />
+                            <KpiCard icon={<Layers3 size={17} />} label="Catalog" value={monitoring.catalog.totalProducts} note={`${monitoring.catalog.aliasCount} aliases`} />
+                          </div>
+                          <p className="quiet">{monitoring.alerts.delivery}</p>
+                        </>
+                      ) : <p className="quiet">Refresh Production Monitor to see search health, store risk, catalog coverage, release readiness, and notification status.</p>}
                     </div>
 
                     <div className="health-table-wrap">

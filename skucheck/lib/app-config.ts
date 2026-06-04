@@ -1,4 +1,4 @@
-export const APP_VERSION = "1.0.0";
+export const APP_VERSION = "1.6.0";
 export const SEARCH_CACHE_TTL_SECONDS = 10 * 60;
 export const SEARCH_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 export const SEARCH_RATE_LIMIT_MAX_REQUESTS = 20;
